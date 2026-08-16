@@ -19,9 +19,15 @@ CGV 용산아이파크몰 IMAX관 - 특정 영화 새 예매 날짜 감지 스�
    버튼이 활성화된(aria-disabled="false") 회차가 하나라도 있는지 DOM에서 직접 확인한다.
    (단순히 "IMAX관" 텍스트가 보이는 것만으로는 True로 치지 않음 — 매진/예매종료/오픈 전
    회차만 나열된 경우는 False로 취급한다.)
-3. 이전 실행 때 저장해둔 state.json(날짜별 예매 가능 여부)과 비교해서, 새로 예매 가능해진
-   날짜가 있으면 ntfy.sh로 푸시 알림을 보낸다. (첫 실행은 기준선만 저장하고 알림을 보내지 않는다.)
-4. 현재 상태를 state.json에 다시 저장한다 (GitHub Actions가 커밋해줌).
+3. state.json에는 "이미 예매 가능하다고 한 번이라도 확인/알림한 날짜" 목록만 누적 저장한다.
+   이번 실행에서 True인데 그 목록에 없는 날짜만 "새로 열린 날짜"로 보고 알림을 보낸 뒤
+   목록에 추가한다. 이미 목록에 있는 날짜(예: 오늘처럼 원래도 예매 가능했던 날짜)는
+   매진→취소표 발생→재예매 가능처럼 상태가 왔다갔다해도 다시 알림을 보내지 않는다.
+   (바로 직전 실행과만 비교하면 이런 매진/재오픈 반복 때마다 오탐 알림이 가기 때문에,
+   "한 번이라도 True였던 날짜"를 영구히 기억하는 방식으로 바꿨다.)
+   첫 실행(state.json이 아예 없을 때)은 현재 열려있는 날짜들을 조용히 기준선으로만
+   저장하고 알림은 보내지 않는다.
+4. 갱신된 목록을 state.json에 다시 저장한다 (GitHub Actions가 커밋해줌).
 
 주의:
 - CGV가 화면 구조(클래스명 등)를 바꾸면 DAY_TAB_SELECTOR나 아래 JS 안의 클래스 매칭을
@@ -109,20 +115,29 @@ def notify(message: str) -> None:
     urllib.request.urlopen(req, timeout=15)
 
 
-def load_prev_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
+def load_known_dates():
+    """이미 예매 가능하다고 확인/알림한 날짜 집합을 불러온다.
+    state.json이 아예 없으면 None(진짜 첫 실행)을 반환한다.
+    예전 버전({날짜: bool} 형식)과도 호환: True였던 날짜는 이미 알려진 날짜로 간주한다.
+    """
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+
+    if isinstance(data, list):
+        return set(data)
+    if isinstance(data, dict):
+        return {d for d, has in data.items() if has}
+    return set()
 
 
-def save_state(state: dict) -> None:
+def save_known_dates(known: set) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(sorted(known), f, ensure_ascii=False, indent=2)
 
 
 def main() -> None:
@@ -153,27 +168,31 @@ def main() -> None:
               "상태를 저장하지 않고 종료합니다.")
         return
 
-    prev = load_prev_state()
-    is_first_run = len(prev) == 0
+    known = load_known_dates()
+    is_first_run = known is None
+    if is_first_run:
+        known = set()
 
-    new_dates = sorted(d for d, has in current.items() if has and not prev.get(d, False))
+    new_dates = sorted(d for d, has in current.items() if has and d not in known)
 
-    print(f"이전 상태: {prev}")
-    print(f"현재 상태: {current}")
+    print(f"이미 알려진 날짜: {sorted(known)}")
+    print(f"현재 예매 가능 상태: {current}")
 
     if is_first_run:
-        print("첫 실행: 기준 상태만 저장하고 알림은 보내지 않음.")
+        known = {d for d, has in current.items() if has}
+        print("첫 실행: 기준 상태만 저장하고 알림은 보내지 않음. 기준선:", sorted(known))
     elif new_dates:
         msg = (
             f"CGV 용산아이파크몰 IMAX '{MOVIE_KEYWORD}' 새 예매 날짜 오픈!\n"
             f"{', '.join(new_dates)}\n{URL}"
         )
-        print("새 날짜 발견 -> 알림 전송:", new_dates)
+        print("새로 예매 가능해진 날짜 발견 -> 알림 전송:", new_dates)
         notify(msg)
+        known = known | set(new_dates)
     else:
-        print("새로운 날짜 없음.")
+        print("새로 예매 가능해진 날짜 없음.")
 
-    save_state(current)
+    save_known_dates(known)
 
 
 if __name__ == "__main__":
