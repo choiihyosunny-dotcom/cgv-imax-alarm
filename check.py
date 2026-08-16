@@ -97,10 +97,25 @@ def save_state(state: dict) -> None:
 def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
-        page.goto(URL, wait_until="networkidle", timeout=60000)
-        current = check_all_dates(page)
-        browser.close()
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="ko-KR",
+        )
+        try:
+            page.goto(URL, wait_until="networkidle", timeout=60000)
+            current = check_all_dates(page)
+        except Exception:
+            print(f"오류 발생. 현재 URL: {page.url}, 제목: {page.title()}")
+            page.screenshot(path="debug.png", full_page=True)
+            with open("debug.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            print("디버그용 debug.png / debug.html 저장함.")
+            raise
+        finally:
+            browser.close()
 
     if not current:
         print("날짜 탭을 하나도 찾지 못했습니다. 사이트 구조가 바뀌었을 수 있습니다. "
