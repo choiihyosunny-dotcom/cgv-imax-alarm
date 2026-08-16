@@ -6,8 +6,12 @@ CGV 용산아이파크몰 IMAX관 - 특정 영화 새 예매 날짜 감지 스�
   가로로 나열되어 있고, 하나를 클릭해야 그 날짜의 상영시간표가 화면에 그려지는 SPA 구조.
   영화 이름 옆에 날짜 텍스트가 붙어있는 구조가 아님 (기존 버전의 잘못된 가정).
 - 날짜 탭 중 일부는 disabled 클래스(dayScroll_disabled)가 붙어 클릭 불가 (해당 극장 휴관일 등).
-- 날짜 탭에는 실제 날짜 값이 DOM에 없고 "오늘/월/화.." + 숫자만 있어서, 탭 순서(0번째=오늘,
-  1번째=내일, ...)로 실제 날짜를 계산한다 (한국 시간 기준).
+- 날짜 탭에는 ISO 날짜 값이 DOM에 없고 "오늘/내일/월/화.." + 숫자만 있다. 숫자는 보통 일(day)
+  이지만 달이 바뀌는 지점에서는 "9.1"처럼 월.일 형태로 나온다.
+  ★ 중요: CGV의 "오늘"은 시스템 날짜와 다를 수 있다. 심야 상영이 24:00~27:32처럼 표기되는 데서
+  보듯 CGV 영업일은 자정을 넘겨 이어지므로, 한국시간 8/17 00:50에도 첫 탭이 아직 "오늘 16"이다.
+  그래서 시스템 날짜를 0번 탭으로 가정하면 전체 날짜가 하루씩 밀린다(실제로 이 버그로 25일
+  오픈을 26일이라고 잘못 알림 보낸 적 있음). 반드시 탭에 적힌 숫자를 읽어 날짜를 확정한다.
 - 영화 하나당 상영시간표 전체가 [class*="accordion_container"] 안에 들어있고, 그 안에
   [class*="screenInfo_contentWrap"] 가 상영관 종류(IMAX관/4DX관/2D 등)별로 나뉘어 있다.
   각 회차는 button[class*="screenInfo_timeLink"]이고, 아직 예매가 열리지 않았거나 매진/종료된
@@ -37,6 +41,7 @@ CGV 용산아이파크몰 IMAX관 - 특정 영화 새 예매 날짜 감지 스�
 
 import json
 import os
+import re
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -85,19 +90,88 @@ def has_bookable_session(page) -> bool:
     return page.evaluate(HAS_BOOKABLE_SESSION_JS, [MOVIE_KEYWORD, SCREEN_KEYWORD])
 
 
+def parse_tab_label(label: str):
+    """탭 숫자 라벨에서 (월 or None, 일)을 뽑는다. '16' -> (None, 16), '9.1' -> (9, 1), '02' -> (None, 2)"""
+    m = re.search(r"(?:(\d{1,2})\s*\.\s*)?(\d{1,2})\s*$", label.strip())
+    if not m:
+        raise ValueError(f"날짜 탭 라벨을 해석할 수 없습니다: {label!r}")
+    month = int(m.group(1)) if m.group(1) else None
+    return month, int(m.group(2))
+
+
+def resolve_tab_dates(tabs):
+    """탭에 적힌 숫자를 기준으로 각 탭의 실제 날짜를 확정한다.
+
+    CGV의 첫 탭("오늘")은 시스템 날짜보다 하루 뒤처져 있을 수 있으므로, 시스템 날짜 주변에서
+    첫 탭의 일(day)과 일치하는 날짜를 찾아 기준점(anchor)으로 삼는다. 탭은 연속된 날짜이므로
+    이후는 하루씩 더해가되, 각 탭에 적힌 숫자와 어긋나지 않는지 검증한다.
+    """
+    today = datetime.now(KST).date()
+    first_month, first_day = parse_tab_label(tabs[0]["label"])
+
+    anchor = None
+    for delta in (0, -1, 1, -2, 2):
+        cand = today + timedelta(days=delta)
+        if cand.day == first_day and (first_month is None or cand.month == first_month):
+            anchor = cand
+            break
+    if anchor is None:
+        raise ValueError(
+            f"첫 날짜 탭({tabs[0]['label']!r})을 시스템 날짜({today}) 근처에서 특정하지 못했습니다."
+        )
+
+    dates = []
+    for i, tab in enumerate(tabs):
+        d = anchor + timedelta(days=i)
+        month, day = parse_tab_label(tab["label"])
+        if d.day != day or (month is not None and d.month != month):
+            raise ValueError(
+                f"날짜 계산이 탭 표시와 어긋납니다: {i}번 탭 표시={tab['label']!r}, 계산={d}. "
+                "사이트 구조가 바뀌었을 수 있어 잘못된 알림을 막기 위해 중단합니다."
+            )
+        dates.append(d)
+    return dates
+
+
+READ_TABS_JS = """
+() => Array.from(document.querySelectorAll('button[class*="dayScroll_scrollItem"]')).map((b) => {
+  const numEl = b.querySelector('[class*="dayScroll_number"]');
+  return { label: (numEl ? numEl.innerText : b.innerText).trim(), disabled: b.disabled };
+})
+"""
+
+
 def check_all_dates(page) -> dict:
     page.wait_for_selector(DAY_TAB_SELECTOR, timeout=30000)
-    count = page.locator(DAY_TAB_SELECTOR).count()
-    today = datetime.now(KST).date()
+    tabs = page.evaluate(READ_TABS_JS)
+    if not tabs:
+        return {}
+
+    dates = resolve_tab_dates(tabs)
+    print("날짜 탭 해석 결과:",
+          ", ".join(f"{t['label']}->{d}{'(휴관)' if t['disabled'] else ''}"
+                    for t, d in zip(tabs, dates)))
 
     result = {}
-    for i in range(count):
-        tab = page.locator(DAY_TAB_SELECTOR).nth(i)
-        if tab.get_attribute("disabled") is not None:
+    for i, (tab_info, d) in enumerate(zip(tabs, dates)):
+        if tab_info["disabled"]:
             continue
+        tab = page.locator(DAY_TAB_SELECTOR).nth(i)
         tab.click()
-        page.wait_for_timeout(1200)
-        d = today + timedelta(days=i)
+        # 클릭한 탭이 실제로 선택 상태가 될 때까지 기다린 뒤 내용을 읽는다
+        # (이전 날짜의 화면을 잘못 읽는 것을 막기 위함).
+        try:
+            page.wait_for_function(
+                """(idx) => {
+                    const btns = document.querySelectorAll('button[class*="dayScroll_scrollItem"]');
+                    return btns[idx] && btns[idx].className.includes('itemActive');
+                }""",
+                arg=i,
+                timeout=10000,
+            )
+        except Exception:
+            print(f"경고: {d} 탭이 선택 상태로 바뀌는 것을 확인하지 못했습니다.")
+        page.wait_for_timeout(1500)
         result[d.isoformat()] = has_bookable_session(page)
     return result
 
