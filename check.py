@@ -6,20 +6,27 @@ CGV 용산아이파크몰 IMAX관 - 특정 영화 새 예매 날짜 감지 스�
   가로로 나열되어 있고, 하나를 클릭해야 그 날짜의 상영시간표가 화면에 그려지는 SPA 구조.
   영화 이름 옆에 날짜 텍스트가 붙어있는 구조가 아님 (기존 버전의 잘못된 가정).
 - 날짜 탭 중 일부는 disabled 클래스(dayScroll_disabled)가 붙어 클릭 불가 (해당 극장 휴관일 등).
-- 오디세이는 "IMAX관\nIMAX LASER 2D\n..." 형태로 상영관 섹션이 나타남.
 - 날짜 탭에는 실제 날짜 값이 DOM에 없고 "오늘/월/화.." + 숫자만 있어서, 탭 순서(0번째=오늘,
   1번째=내일, ...)로 실제 날짜를 계산한다 (한국 시간 기준).
+- 영화 하나당 상영시간표 전체가 [class*="accordion_container"] 안에 들어있고, 그 안에
+  [class*="screenInfo_contentWrap"] 가 상영관 종류(IMAX관/4DX관/2D 등)별로 나뉘어 있다.
+  각 회차는 button[class*="screenInfo_timeLink"]이고, 아직 예매가 열리지 않았거나 매진/종료된
+  회차는 aria-disabled="true"가 붙는다. 좌석수가 보이며 클릭 가능한 회차만 aria-disabled="false".
 
 동작 방식:
 1. Playwright로 페이지를 열고, 비활성화되지 않은 날짜 탭을 순서대로 클릭한다.
-2. 각 날짜에서 MOVIE_KEYWORD가 등장하는 위치 주변에 SCREEN_KEYWORD(IMAX관)가 있는지 확인해서
-   그 날짜에 오디세이 IMAX 상영이 있는지 여부를 기록한다.
-3. 이전 실행 때 저장해둔 state.json(날짜별 상영 여부)과 비교해서, 새로 상영이 생긴 날짜가
-   있으면 ntfy.sh로 푸시 알림을 보낸다. (첫 실행은 기준선만 저장하고 알림을 보내지 않는다.)
+2. 각 날짜에서 MOVIE_KEYWORD(오디세이)의 SCREEN_KEYWORD(IMAX관) 섹션 안에 실제로 예매
+   버튼이 활성화된(aria-disabled="false") 회차가 하나라도 있는지 DOM에서 직접 확인한다.
+   (단순히 "IMAX관" 텍스트가 보이는 것만으로는 True로 치지 않음 — 매진/예매종료/오픈 전
+   회차만 나열된 경우는 False로 취급한다.)
+3. 이전 실행 때 저장해둔 state.json(날짜별 예매 가능 여부)과 비교해서, 새로 예매 가능해진
+   날짜가 있으면 ntfy.sh로 푸시 알림을 보낸다. (첫 실행은 기준선만 저장하고 알림을 보내지 않는다.)
 4. 현재 상태를 state.json에 다시 저장한다 (GitHub Actions가 커밋해줌).
 
 주의:
-- CGV가 화면 구조(클래스명 등)를 바꾸면 DAY_TAB_SELECTOR나 SCREEN_KEYWORD를 다시 맞춰야 한다.
+- CGV가 화면 구조(클래스명 등)를 바꾸면 DAY_TAB_SELECTOR나 아래 JS 안의 클래스 매칭을
+  다시 맞춰야 한다. 클래스는 CSS 모듈 해시(__xxxxx)가 붙어 있어서 정확한 전체 클래스명 대신
+  [class*="..."] 부분일치로 매칭해 해시가 바뀌어도 어느 정도 버티도록 했다.
 """
 
 import json
@@ -38,13 +45,38 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 DAY_TAB_SELECTOR = "button.dayScroll_scrollItem__IZ35T"
 KST = timezone(timedelta(hours=9))
 
+# 현재 선택된 날짜에서, MOVIE_KEYWORD 영화의 SCREEN_KEYWORD 상영관에 예매 버튼이
+# 활성화된(클릭 가능한) 회차가 하나라도 있는지 DOM에서 직접 판단하는 스크립트.
+HAS_BOOKABLE_SESSION_JS = """
+([movieKeyword, screenKeyword]) => {
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node, movieTitleNode = null;
+  while ((node = walker.nextNode())) {
+    if (node.textContent.includes(movieKeyword)) { movieTitleNode = node; break; }
+  }
+  if (!movieTitleNode) return false;
 
-def has_movie_screen(page_text: str) -> bool:
-    idx = page_text.find(MOVIE_KEYWORD)
-    if idx == -1:
-        return False
-    window = page_text[idx : idx + 800]
-    return SCREEN_KEYWORD in window
+  let container = movieTitleNode.parentElement;
+  while (container && !(container.className && container.className.toString().includes('accordion_container'))) {
+    container = container.parentElement;
+  }
+  if (!container) return false;
+
+  const contentWraps = Array.from(container.querySelectorAll('[class*="screenInfo_contentWrap"]'));
+  const target = contentWraps.find((cw) => {
+    const h3 = cw.querySelector('h3');
+    return h3 && h3.innerText.includes(screenKeyword);
+  });
+  if (!target) return false;
+
+  const buttons = Array.from(target.querySelectorAll('button[class*="screenInfo_timeLink"]'));
+  return buttons.some((b) => b.getAttribute('aria-disabled') === 'false');
+}
+"""
+
+
+def has_bookable_session(page) -> bool:
+    return page.evaluate(HAS_BOOKABLE_SESSION_JS, [MOVIE_KEYWORD, SCREEN_KEYWORD])
 
 
 def check_all_dates(page) -> dict:
@@ -59,9 +91,8 @@ def check_all_dates(page) -> dict:
             continue
         tab.click()
         page.wait_for_timeout(1200)
-        text = page.inner_text("body")
         d = today + timedelta(days=i)
-        result[d.isoformat()] = has_movie_screen(text)
+        result[d.isoformat()] = has_bookable_session(page)
     return result
 
 
